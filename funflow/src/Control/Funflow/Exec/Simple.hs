@@ -23,29 +23,42 @@ module Control.Funflow.Exec.Simple
 
 import           Control.Arrow                               (returnA)
 import           Control.Arrow.Async
-import           Control.Arrow.Free                          (eval, type (~>))
-import           Control.Concurrent.Async                    (withAsync)
-import           Control.Funflow.Base
-import           Control.Funflow.ContentHashable
-import qualified Control.Funflow.ContentStore                as CS
-import           Control.Funflow.External
-import           Control.Funflow.External.Coordinator
-import           Control.Funflow.External.Coordinator.Memory
-import           Control.Funflow.External.Executor           (executeLoop)
+import           Control.Arrow.Free                          (type (~>), eval)
+import           Control.Concurrent.Async.Lifted             (async, pollSTM,
+                                                              withAsync)
+import qualified Control.Concurrent.STM                      as STM
 import           Control.Exception.Safe                      (Exception,
                                                               SomeException,
                                                               bracket,
                                                               onException,
                                                               throwM, try)
+import           Control.Funflow.Base
+import           Control.Funflow.ContentHashable
+import qualified Control.Funflow.ContentStore                as CS
+import           Control.Funflow.Exec.Progress               as Progress
+import           Control.Funflow.External
+import           Control.Funflow.External.Coordinator
+import           Control.Funflow.External.Coordinator.Memory
+import           Control.Funflow.External.Executor           (executeLoop)
+import           Control.Monad.Fix                           (fix)
 import           Control.Monad.IO.Class                      (liftIO)
 import           Control.Monad.Trans.Class                   (lift)
 import qualified Data.ByteString                             as BS
+import           Data.Foldable                               (traverse_)
 import           Data.Monoid                                 ((<>))
 import           Data.Void
 import           Katip
 import           Path
+import           Streaming                                   (Of, Stream)
+import qualified Streaming.Prelude                           as Streaming
 import           System.IO                                   (stderr)
-import Data.Foldable (traverse_)
+
+-- | Flow execution monad.
+--   Flows may:
+--   - Execute actions in IO
+--   - Write log messages
+--   - Yield progress updates in a stream
+type FlowM = Stream (Of Progress) (KatipContextT IO)
 
 -- | Simple evaulation of a flow
 runFlowEx :: forall c eff ex a b. (Coordinator c, Exception ex)
@@ -58,10 +71,20 @@ runFlowEx :: forall c eff ex a b. (Coordinator c, Exception ex)
                  --   multiple configurations.
           -> Flow eff ex a b
           -> a
-          -> KatipContextT IO b
+          -> FlowM b
 runFlowEx _ cfg store runWrapped confIdent flow input = do
     hook <- initialise cfg
-    runAsyncA (eval (runFlow' hook) flow) input
+    progressChan :: STM.TChan Progress <- liftIO $ STM.newTChanIO
+    runThread <- lift . async $ runAsyncA (eval (runFlow' hook progressChan) flow) input
+    Streaming.untilRight . liftIO . STM.atomically . fix $ \retry -> do
+      complete <- pollSTM runThread
+      nextProgress <- STM.tryReadTChan progressChan
+      case (complete, nextProgress) of
+        -- If there is progress to report, we report it before returning the final value
+        (_, Just pItem)             -> return $ Left pItem
+        (Just (Right res), Nothing) -> return $ Right res
+        (Just (Left err), Nothing)  -> throwM err
+        (Nothing, Nothing)          -> retry
   where
     simpleOutPath item = toFilePath
       $ CS.itemPath store item </> [relfile|out|]
@@ -97,24 +120,29 @@ runFlowEx _ cfg store runWrapped confIdent flow input = do
             -> i
             -> o
             -> MDWriter i o
-            -> KatipContextT IO ()
+            -> (KatipContextT IO) ()
     writeMd _ _ _ Nothing = return ()
     writeMd chash i o (Just writer) =
       let kvs = writer i o
       in traverse_ (uncurry $ CS.setMetadata store chash) kvs
 
 
-    runFlow' :: Hook c -> Flow' eff a1 b1 -> AsyncA (KatipContextT IO) a1 b1
-    runFlow' _ (Step props f) = withStoreCache (cache props)
+    runFlow' :: Hook c
+             -> STM.TChan Progress
+             -> Flow' eff a1 b1
+             -> AsyncA (KatipContextT IO) a1 b1
+    runFlow' _ _ (Step props f) = withStoreCache (cache props)
       . AsyncA $ \x -> do
           let out = f x
           case cache props of
-            NoCache -> return ()
+            NoCache       -> return ()
             Cache key _ _ -> writeMd (key confIdent x) x out $ mdpolicy props
           return out
-    runFlow' _ (StepIO props f) = withStoreCache (cache props)
+    runFlow' _ _ (StepIO props f) = withStoreCache (cache props)
       . liftAsyncA $ AsyncA f
-    runFlow' po (External props toTask) = AsyncA $ \x -> do
+    runFlow' po progressChan (External props toTask) = AsyncA $ \x -> do
+      liftIO . STM.atomically $
+        STM.writeTChan progressChan $ Progress.Msg "\n\nCthulhu Fhtagn!\n\n"
       chash <- liftIO $ contentHash (x, toTask x)
       CS.lookup store chash >>= \case
         -- The item in question is already in the store. No need to submit a task.
@@ -149,7 +177,7 @@ runFlowEx _ cfg store runWrapped confIdent flow input = do
               mbStdout <- CS.getMetadataFile store chash [relfile|stdout|]
               mbStderr <- CS.getMetadataFile store chash [relfile|stderr|]
               throwM $ ExternalTaskFailed td ti mbStdout mbStderr
-    runFlow' _ (PutInStore f) = AsyncA $ \x -> katipAddNamespace "putInStore" $ do
+    runFlow' _ _ (PutInStore f) = AsyncA $ \x -> katipAddNamespace "putInStore" $ do
       chash <- liftIO $ contentHash x
       CS.constructOrWait store chash >>= \case
         CS.Pending void -> absurd void
@@ -162,14 +190,14 @@ runFlowEx _ cfg store runWrapped confIdent flow input = do
             (do $(logTM) WarningS . ls $ "Exception in construction: removing " <> show chash
                 CS.removeFailed store chash
             )
-    runFlow' _ (GetFromStore f) = AsyncA $ \case
+    runFlow' _ _ (GetFromStore f) = AsyncA $ \case
       CS.All item -> lift . f $ CS.itemPath store item
       item CS.:</> path -> lift . f $ CS.itemPath store item </> path
-    runFlow' _ (InternalManipulateStore f) = AsyncA $ \i ->lift $ f store i
-    runFlow' _ (Wrapped props w) = withStoreCache (cache props)
+    runFlow' _ _ (InternalManipulateStore f) = AsyncA $ \i -> lift $ f store i
+    runFlow' _ _ (Wrapped props w) = withStoreCache (cache props)
       $ runWrapped w
 
--- | Run a flow in a logging context.
+-- | Run a flow in a logging context, converting progress updates to log messages.
 runFlowLog :: forall c eff ex a b. (Coordinator c, Exception ex)
            => c
            -> Config c
@@ -182,9 +210,10 @@ runFlowLog :: forall c eff ex a b. (Coordinator c, Exception ex)
            -> a
            -> KatipContextT IO (Either ex b)
 runFlowLog c cfg store runWrapped confIdent flow input =
-  try $ runFlowEx c cfg store runWrapped confIdent flow input
+  try $ Streaming.mapM_ (logFM InfoS . ls . show)
+      $ runFlowEx c cfg store runWrapped confIdent flow input
 
--- | Run a flow, discarding all logging.
+-- | Run a flow, discarding all logging and progress updates.
 runFlow :: forall c eff ex a b. (Coordinator c, Exception ex)
         => c
         -> Config c
