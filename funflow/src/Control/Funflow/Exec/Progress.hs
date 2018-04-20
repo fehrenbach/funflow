@@ -1,12 +1,29 @@
 -- | Progress reports from a running executor.
 module Control.Funflow.Exec.Progress
-  ( GraphUpdate
+  ( GraphUpdate(..)
+  , NodeId
   , Progress(..)
+  , Status(..)
+  , NodeUpdate(..)
+  , metadata
+  , inputHash
+  , outputHash
+  , status
+  , mkNodeId
   ) where
 
-import qualified Data.Text as T
+import           Control.Funflow.ContentHashable (ContentHash)
+import           Control.Monad.IO.Class          (MonadIO, liftIO)
+import qualified Data.Text                       as T
+import           System.Random                   (randomIO)
 
-type NodeId = ()
+newtype NodeId = NodeId Int
+  deriving Show
+
+-- | Create a new node id. Allows us to easily change what we use for a node
+-- identifier later.
+mkNodeId :: MonadIO m => m NodeId
+mkNodeId = liftIO $ NodeId <$> randomIO
 
 data Status
   = Started
@@ -17,8 +34,22 @@ data Status
 
 data NodeUpdate
   = AddMetadata (T.Text, T.Text)
+  | AddInputsHash ContentHash
+  | AddOutputsHash ContentHash
   | UpdateStatus Status
   deriving Show
+
+metadata :: NodeId -> (T.Text, T.Text) -> Progress
+metadata nid = GraphUpdate . UpdateNode nid . AddMetadata
+
+inputHash :: NodeId -> ContentHash -> Progress
+inputHash nid = GraphUpdate . UpdateNode nid . AddInputsHash
+
+outputHash :: NodeId -> ContentHash -> Progress
+outputHash nid = GraphUpdate . UpdateNode nid . AddOutputsHash
+
+status :: NodeId -> Status -> Progress
+status nid = GraphUpdate . UpdateNode nid . UpdateStatus
 
 data GraphUpdate
     -- | Introduce a node, with its parent nodes
@@ -28,5 +59,5 @@ data GraphUpdate
 
 data Progress
   = Msg T.Text
-  | GraphUpdate
+  | GraphUpdate GraphUpdate
   deriving Show
