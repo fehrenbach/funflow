@@ -20,15 +20,17 @@ main :: IO ()
 main = do
     cwd <- getCurrentDir
     r <- withSimpleLocalRunner (cwd </> [reldir|funflow-example/store|]) $ \run -> do
-      run flow 3
+      run mainFlow 3
     case r of
       Left err ->
         putStrLn $ "FAILED: " ++ displayException err
       Right out ->
         putStrLn $ "SUCCESS: " ++ out
 
-flow :: SimpleFlow Int String
-flow = proc n -> do
+-- | This flow takes a number, builds a C program to process that number,
+-- and returns the program's output.
+mainFlow :: SimpleFlow Int String
+mainFlow = proc n -> do
     moduleDouble <- compileModule -<
       "int times2(int n) { return 2*n; }\n"
     moduleSquare <- compileModule -<
@@ -47,6 +49,9 @@ flow = proc n -> do
     out <- runExec -< (exec, [show n])
     readString_ -< out
 
+-- | This flow takes a string which is assumed to be the source code
+--   for a 'C' module. It writes this to a file, then uses an external
+--   step to compile the module.
 compileModule :: SimpleFlow String (Content File)
 compileModule = proc csrc -> do
     cInput <- writeString -< (csrc, [relfile|out.c|])
@@ -68,6 +73,8 @@ compileModule = proc csrc -> do
       , Docker.args = ["/input/data/out.c", "/output/out.o"]
       }
 
+-- | This flow takes a list of files which are assumed to be 'C' modules.
+--   It uses an external step to compile those modules into an executable.
 compileExec :: SimpleFlow [Content File] (Content File)
 compileExec = proc mods -> do
     scriptInput <- writeExecutableString -< (compileScript, [relfile|compile.sh|])
@@ -94,6 +101,10 @@ compileExec = proc mods -> do
                       ]
       }
 
+-- | This flow takes a file which is assumed to be an executable,
+-- and a list of strings that are arguments for the executable.
+-- It uses an external step to run the executable with the given arguments.
+-- The output is stored in the file @out@ in the returned item.
 runExec :: SimpleFlow (Content File, [String]) CS.Item
 runExec = proc (exec, args) -> do
     scriptInput <- writeExecutableString -< (runScript, [relfile|run.sh|])
